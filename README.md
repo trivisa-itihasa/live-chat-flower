@@ -1,57 +1,59 @@
 # Live Chat Flower
 
-Twitch のチャットを、ニコニコ動画のように映像の上へ流す Tampermonkey ユーザースクリプトです。
+A Tampermonkey userscript that scrolls Twitch chat across the stream from right to left, the way comments appear on Niconico.
 
-## 特徴
+## Features
 
-- Twitch のチャットサーバーに匿名・読み取り専用で接続してコメントを取得します。チャット欄を閉じていても、全画面表示でも動作します
-- エモートを画像で表示します
-- モデレーターが削除したコメントや、BAN されたユーザーのコメントは画面からも消えます
-- NG ワード（文字列・正規表現）と NG ユーザーを設定できます
-- `Alt+C` でコメントの表示 / 非表示を切り替えられます
+- Reads chat from Twitch's IRC server as an anonymous, read-only user, so it works with the chat panel closed and in fullscreen.
+- Shows Twitch emotes as images.
+- Removes a message from the screen when a moderator deletes it, and removes a user's messages when they are banned or timed out.
+- Filters messages by word (plain text or regular expression) and by user.
+- `Alt+C` shows or hides the comments.
 
-## インストール
+## Installation
 
-1. ブラウザに [Tampermonkey](https://www.tampermonkey.net/) を入れます（Chrome では拡張機能の設定で「ユーザー スクリプトを許可する」をオンにしてください）
-2. このリポジトリの [live-chat-flower.user.js](live-chat-flower.user.js) を開き、「Raw」ボタンを押すと Tampermonkey のインストール画面が開きます
-3. Twitch の配信ページを開くと、コメントが流れ始めます
+1. Install [Tampermonkey](https://www.tampermonkey.net/). In Chrome, also turn on "Allow User Scripts" on the extension's details page.
+2. Open [live-chat-flower.user.js](live-chat-flower.user.js) and click "Raw". Tampermonkey will open its install page.
+3. Open a live stream on Twitch.
 
-## 設定
+## Configuration
 
-スクリプト冒頭の `CONFIG` の値を書き換えて設定します。主な項目は次のとおりです。
+Edit the `CONFIG` object at the top of the script. The main options are:
 
-| 項目 | 初期値 | 内容 |
+| Option | Default | Description |
 |---|---|---|
-| `OPACITY` | `0.8` | コメントの不透明度（0〜1） |
-| `FONT_FAMILY` / `FONT_WEIGHT` | ヒラギノ・メイリオ / `bold` | フォント |
-| `LINES` | `12` | 映像の高さを何行に分けるか（大きいほど文字が小さくなる） |
-| `DURATION_SEC` | `5` | コメントが画面を横切るまでの秒数（小さいほど速い） |
-| `SPEED_MODE` | `'nico'` | `'nico'`: 長いコメントほど速い / `'constant'`: すべて同じ速さ |
-| `DISPLAY_AREA` | `1.0` | 映像の上から何割の範囲にコメントを流すか |
-| `WHEN_FULL` | `'overlap'` | 空いている行がないとき、重ねて流す（`'overlap'`）か表示しない（`'drop'`）か |
-| `NG_WORDS` / `NG_USERS` | ボット名など | 流さないコメント・ユーザー |
-| `TOGGLE_HOTKEY` | `'Alt+C'` | 表示 / 非表示の切り替えキー |
+| `OPACITY` | `0.8` | Comment opacity, from 0 to 1 |
+| `FONT_FAMILY` / `FONT_WEIGHT` | Hiragino, Meiryo / `bold` | Font |
+| `LINES` | `12` | How many lines the video height is divided into. Higher values give smaller text. |
+| `DURATION_SEC` | `5` | Seconds a comment takes to cross the screen. Lower is faster. |
+| `SPEED_MODE` | `'nico'` | `'nico'`: every comment takes the same time to cross, so longer ones move faster. `'constant'`: every comment moves at the same speed. |
+| `DISPLAY_AREA` | `1.0` | Portion of the video, measured from the top, that comments can use. `0.5` is the top half. |
+| `WHEN_FULL` | `'overlap'` | What happens when every line is taken: overlap other comments (`'overlap'`) or skip the new one (`'drop'`). |
+| `NG_WORDS` / `NG_USERS` | Common bots | Words and users to filter out |
+| `TOGGLE_HOTKEY` | `'Alt+C'` | Key that shows or hides the comments |
 
-このほか、文字色・縁取り・ユーザー名の色の使用・投稿者名の表示・文字数の上限なども設定できます。各項目の説明はスクリプト内のコメントを参照してください。
+You can also set the text color, outline, whether to use each chatter's name color, whether to show usernames, and a length limit. The comments in the script (in Japanese) describe every option.
 
-## 構成
+## How it works
 
-コメントを取得する部分（プラットフォーム別）と、コメントを流す部分（共通）を分けています。両者は共通のコメント形式 `FlowComment` だけでやり取りします。
+Fetching chat is platform-specific; drawing it is not. The two sides only exchange `FlowComment` objects.
 
 ```
-[Twitch 固有]                              [共通]
-TwitchChatSource ──FlowComment──▶ LiveChatFlower ──▶ フィルタ ──▶ FlowRenderer
-TwitchAdapter（URL から配信を特定、<video> を探す）   （URL・プレイヤーの監視）        （行の割り当て・アニメーション）
+TwitchChatSource ──FlowComment──▶ LiveChatFlower ──▶ filter ──▶ FlowRenderer
 ```
 
-別のプラットフォームに対応するには、コメント取得部分（`CommentSource`）とアダプタ（`PlatformAdapter`）を実装して `ADAPTERS` に追加し、ヘッダーの `@match` に対象の URL を加えます。共通部分は変更不要です。
+- `TwitchChatSource` and `TwitchAdapter` (Twitch-specific) connect to chat, work out the channel from the URL, and find the `<video>` element.
+- `LiveChatFlower` (shared) watches the URL and the player, and reconnects when you switch channels.
+- `FlowRenderer` (shared) assigns comments to lines so they don't overlap, and animates them.
 
-## 制限事項
+To support another site, implement a `CommentSource` and a `PlatformAdapter`, add the adapter to `ADAPTERS`, and add the site's URL to `@match` in the script header. The shared code stays the same.
 
-- ライブ配信のみ対応しています。過去の配信（VOD）のチャットリプレイには対応していません
-- BTTV / 7TV / FFZ のエモートは画像ではなく名前のテキストで表示されます
-- 全画面表示やシアターモードの切り替えなどで映像のサイズが変わると、流れている途中のコメントはいったん消えます
+## Limitations
 
-## ライセンス
+- Live streams only. Chat replay on past broadcasts (VODs) isn't supported.
+- BTTV, 7TV and FFZ emotes appear as text.
+- Comments on screen are cleared whenever the video changes size, such as when you enter fullscreen or theater mode.
+
+## License
 
 [MIT](LICENSE)
