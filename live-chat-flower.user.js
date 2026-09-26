@@ -24,7 +24,7 @@
     // フォント（CSS の font-family と同じ書式）
     FONT_FAMILY: '"Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, "Noto Sans JP", sans-serif',
     // 文字の太さ（'normal' / 'bold' / 100〜900）
-    FONT_WEIGHT: 'bold',
+    FONT_WEIGHT: '600',
     // コメントの大きさ: 映像の高さを何行に分けるか（大きいほど文字が小さくなる）
     LINES: 12,
     // 1行の高さに対する文字サイズの割合（1.0 で行間なし）
@@ -34,9 +34,9 @@
     // true: チャットのユーザー名の色でコメントを表示（色を設定していないユーザーは TEXT_COLOR）
     USE_USER_COLOR: false,
     // 縁取りの色
-    OUTLINE_COLOR: 'rgba(0, 0, 0, 0.8)',
+    OUTLINE_COLOR: 'rgba(0, 0, 0, 0.5)',
     // 縁取りの太さ（文字サイズに対する割合。0 で縁取りなし）
-    OUTLINE_WIDTH: 0.05,
+    OUTLINE_WIDTH: 0.04,
     // コメントの先頭に投稿者名を表示する
     SHOW_AUTHOR_NAME: false,
     // エモートを画像で表示する（false: エモート名をテキストで表示）
