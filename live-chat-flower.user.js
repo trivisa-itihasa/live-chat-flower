@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Live Chat Flower
 // @namespace    live-chat-flower
-// @version      1.0.0
-// @description  ライブ配信のチャットをニコニコ動画のように映像の上へ流します（対応: Twitch）
+// @version      1.1.0
+// @description  ライブ配信のチャットをニコニコ動画のように映像の上へ流します（対応: Twitch、YouTube）
 // @match        https://www.twitch.tv/*
+// @match        https://www.youtube.com/*
 // @grant        GM_registerMenuCommand
 // @run-at       document-idle
 // @noframes
@@ -32,6 +33,7 @@
     // 文字色
     TEXT_COLOR: '#ffffff',
     // true: チャットのユーザー名の色でコメントを表示（色を設定していないユーザーは TEXT_COLOR）
+    //       YouTube では配信者・モデレーター・メンバーだけがチャット欄と同じ色になる
     USE_USER_COLOR: false,
     // 縁取りの色
     OUTLINE_COLOR: 'rgba(0, 0, 0, 0.5)',
@@ -69,7 +71,8 @@
       // 'ネタバレ',
       // /https?:\/\//i,
     ],
-    // NG ユーザー（ログイン名または表示名。大文字小文字を区別しない）
+    // NG ユーザー（ログイン名・表示名・ユーザー ID のいずれか。大文字小文字を区別しない）
+    // YouTube ではハンドル（先頭の @ はあってもなくてもよい）またはチャンネル ID（UC…）
     NG_USERS: ['nightbot', 'streamelements', 'moobot', 'fossabot', 'streamlabs', 'wizebot'],
     // モデレーターが削除したコメントや BAN されたユーザーのコメントを画面から消す
     REMOVE_DELETED: true,
@@ -86,6 +89,14 @@
     TWITCH: {
       // サブスク継続・アナウンスなどに添えられたメッセージも流す
       SHOW_USERNOTICE_MESSAGES: true,
+    },
+
+    YOUTUBE: {
+      // 'all': すべてのメッセージ（チャット欄の「チャット」）
+      // 'top': チャット欄の「トップチャット」（スパムの可能性があるメッセージなどを除いたもの）
+      CHAT_MODE: 'all',
+      // スーパーチャットやメンバー歴のお祝い（マイルストーン）に添えられたメッセージも流す
+      SHOW_PAID_MESSAGES: true,
     },
 
     // 動作ログをコンソールに出す
@@ -156,6 +167,7 @@
    * @property {HTMLVideoElement} video
    * @property {Element} [parent]    コメントレイヤーを挿入する親要素（省略時: video の親）
    * @property {Node|null} [before]  この要素の直前に挿入（省略時: video の直後。null で末尾）
+   * @property {string} [zIndex]     コメントレイヤーの z-index（省略時: 指定しない）
    */
 
   /* ===========================================================================
@@ -229,8 +241,8 @@
       if (!text) return false;
       if (config.IGNORE_COMMANDS && /^[!！]/.test(text)) return false;
 
-      const { login, name } = comment.author;
-      if (ngUsers.has(login.toLowerCase()) || ngUsers.has(name.toLowerCase())) return false;
+      const { id, login, name } = comment.author;
+      if ([id, login, name].some(u => ngUsers.has(u.toLowerCase()))) return false;
 
       const lower = text.toLowerCase();
       return !ngWords.some(w => (typeof w === 'string' ? lower.includes(w) : w.test(text)));
@@ -367,6 +379,7 @@
 
       const layer = document.createElement('div');
       layer.className = 'lcf-layer';
+      if (player.zIndex) layer.style.zIndex = player.zIndex;
       const stage = document.createElement('div');
       stage.className = 'lcf-stage';
       stage.style.display = this.visible ? '' : 'none';
@@ -916,6 +929,357 @@
   };
 
   /* ===========================================================================
+   * 8. プラットフォーム: YouTube
+   *
+   * チャットは YouTube のウェブ版が使っている API（get_live_chat）を数秒おきに呼んで取得する。
+   * Twitch と同じくページ上のチャット欄を読むわけではないので、チャット欄を閉じていても、
+   * 全画面表示でも動作する。
+   * ======================================================================== */
+
+  const YOUTUBE_ORIGIN = 'https://www.youtube.com';
+  const YOUTUBE_POLL_MS = 2000;           // チャットを取得する間隔
+  const YOUTUBE_BATCH_SLACK_MS = 3000;    // 1回の取得分の投稿時刻は、取得の間隔よりこれくらい広がることがある
+  const YOUTUBE_INITIAL_DATA_RE = /(?:window\["ytInitialData"\]|var ytInitialData)\s*=\s*(?=\{)/;
+  const YOUTUBE_CONFIG_RE = /ytcfg\.set\((?=\{)/g;
+  const YOUTUBE_EMOTE_SIZE_RE = /=w\d+-h\d+/;
+  const YOUTUBE_EMOTE_SIZES = [24, 48, 96, 192];
+  // ユーザー名の色（YouTube のチャット欄と同じ。上にあるものほど優先）
+  const YOUTUBE_NAME_COLORS = { OWNER: '#ffd600', MODERATOR: '#5e84f1', MEMBER: '#2ba640' };
+
+  /** text の start 文字目（'{'）から始まる JSON オブジェクトを読み取る。文字列の中の括弧は数えない */
+  function extractJsonObject(text, start) {
+    let depth = 0;
+    let inString = false;
+    for (let i = start; i < text.length; i++) {
+      const c = text[i];
+      if (inString) {
+        if (c === '\\') i++;
+        else if (c === '"') inString = false;
+      } else if (c === '"') {
+        inString = true;
+      } else if (c === '{') {
+        depth++;
+      } else if (c === '}' && --depth === 0) {
+        return JSON.parse(text.slice(start, i + 1));
+      }
+    }
+    return null;
+  }
+
+  /** HTML に埋め込まれた ytInitialData（ページの初期データ） */
+  function readYouTubeInitialData(html) {
+    const m = YOUTUBE_INITIAL_DATA_RE.exec(html);
+    return m ? extractJsonObject(html, m.index + m[0].length) : null;
+  }
+
+  /** HTML に埋め込まれた ytcfg（API に送るクライアント情報など） */
+  function readYouTubeConfig(html) {
+    const config = {};
+    for (const m of html.matchAll(YOUTUBE_CONFIG_RE)) {
+      Object.assign(config, extractJsonObject(html, m.index + m[0].length));
+    }
+    return config;
+  }
+
+  /**
+   * continuations（次に取得する位置）を読み取る
+   * @returns {{token: string, minDelay: number, reload: boolean}|null}
+   *   minDelay: 次の取得までに待つべき時間 / reload: 取得すると過去ログから返ってくる
+   */
+  function parseYouTubeContinuation(continuations) {
+    const c = continuations?.[0] || {};
+    const data = c.invalidationContinuationData || c.timedContinuationData || c.reloadContinuationData;
+    if (!data?.continuation) return null;
+    return {
+      token: data.continuation,
+      // invalidationContinuationData の timeoutMs は、更新の通知を受け取るクライアント向けの値なので使わない
+      minDelay: c.timedContinuationData ? data.timeoutMs || 0 : 0,
+      reload: !!c.reloadContinuationData,
+    };
+  }
+
+  /**
+   * message.runs（テキストと絵文字の並び）を本文に変換する。
+   * Unicode の絵文字は文字のまま、チャンネル独自のカスタム絵文字は画像にする。
+   * @returns {{text: string, parts: CommentPart[]}}
+   */
+  function buildYouTubeParts(runs) {
+    const parts = [];
+    for (const run of runs) {
+      const { emoji } = run;
+      if (!emoji) {
+        if (run.text) parts.push({ type: 'text', text: run.text });
+        continue;
+      }
+      if (!emoji.isCustomEmoji && emoji.emojiId) {
+        parts.push({ type: 'text', text: emoji.emojiId });
+        continue;
+      }
+      const alt = emoji.shortcuts?.[0] || emoji.emojiId || '';
+      const url = emoji.image?.thumbnails?.[0]?.url;
+      if (!url) {
+        if (alt) parts.push({ type: 'text', text: alt });
+        continue;
+      }
+      // YouTube が示す画像は 24px と 48px だけなので、URL のサイズ指定を書き換えて大きいものも用意する
+      const srcset = YOUTUBE_EMOTE_SIZE_RE.test(url)
+        ? YOUTUBE_EMOTE_SIZES.map(s => `${url.replace(YOUTUBE_EMOTE_SIZE_RE, `=w${s}-h${s}`)} ${s}w`).join(', ')
+        : undefined;
+      parts.push({ type: 'emote', alt, url, srcset });
+    }
+    return { text: parts.map(p => (p.type === 'text' ? p.text : p.alt)).join(''), parts };
+  }
+
+  /** バッジから配信者・モデレーター・メンバーを判定し、名前の色を返す（どれでもなければ ''） */
+  function getYouTubeNameColor(badges = []) {
+    const roles = badges.map(b => b.liveChatAuthorBadgeRenderer).filter(Boolean)
+      .map(b => b.icon?.iconType || (b.customThumbnail ? 'MEMBER' : ''));
+    const role = Object.keys(YOUTUBE_NAME_COLORS).find(r => roles.includes(r));
+    return role ? YOUTUBE_NAME_COLORS[role] : '';
+  }
+
+  /**
+   * チャット欄の1項目を FlowComment に変換する
+   * @returns {{comment: FlowComment, time: number}|null}  time は投稿時刻（ミリ秒）。流さない項目なら null
+   */
+  function parseYouTubeItem(item, options) {
+    const renderer = item.liveChatTextMessageRenderer
+      || (options.SHOW_PAID_MESSAGES ? item.liveChatPaidMessageRenderer || item.liveChatMembershipItemRenderer : null);
+    if (!renderer?.message?.runs) return null; // メッセージのないスーパーチャット・スーパーステッカー・システムメッセージなど
+
+    const name = renderer.authorName?.simpleText || '';
+    return {
+      time: Number(renderer.timestampUsec) / 1000,
+      comment: {
+        id: renderer.id || '',
+        ...buildYouTubeParts(renderer.message.runs),
+        author: {
+          id: renderer.authorExternalChannelId || '',
+          login: name.replace(/^@/, ''),
+          name,
+          color: getYouTubeNameColor(renderer.authorBadges),
+        },
+      },
+    };
+  }
+
+  /** @returns {DeleteTarget|null} コメントを削除する操作なら、その対象 */
+  function parseYouTubeDeleteAction(action) {
+    const byId = action.markChatItemAsDeletedAction || action.removeChatItemAction;
+    if (byId?.targetItemId) return { id: byId.targetItemId };
+    const byAuthor = action.markChatItemsByAuthorAsDeletedAction || action.removeChatItemByAuthorAction;
+    if (byAuthor?.externalChannelId) return { authorId: byAuthor.externalChannelId };
+    return null;
+  }
+
+  /** @implements {CommentSource} */
+  class YouTubeChatSource {
+    /**
+     * @param {string} videoId
+     * @param {SourceHandlers} handlers
+     */
+    constructor(videoId, handlers, options) {
+      this.videoId = videoId;
+      this.handlers = handlers;
+      this.options = options;
+      this.stopped = true;
+      this.context = null;           // API に送るクライアント情報
+      this.continuation = '';        // 次に取得する位置
+      this.skipBacklog = false;      // true: 次の取得結果は接続前の過去ログなので流さない
+      this.pollDelay = YOUTUBE_POLL_MS; // 今回の取得の前に待った時間
+      this.retryCount = 0;
+      this.timer = 0;
+      this.abort = null;
+      this.pending = new Set();      // 流す時刻を待っているコメント
+      this.placeholders = new Set(); // 審査中で中身がまだ届いていないメッセージの ID
+    }
+
+    start() {
+      this.stopped = false;
+      this.connect();
+    }
+
+    stop() {
+      this.stopped = true;
+      clearTimeout(this.timer);
+      this.abort?.abort();
+      for (const entry of this.pending) clearTimeout(entry.timer);
+      this.pending.clear();
+    }
+
+    async request(path, init) {
+      this.abort = new AbortController();
+      const res = await fetch(YOUTUBE_ORIGIN + path, { ...init, signal: this.abort.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    }
+
+    /** チャットのページを読み、API に送るクライアント情報と最初に取得する位置を得る */
+    async connect() {
+      try {
+        // ログイン状態や同意画面の設定を反映させるため、ページの取得だけは Cookie を送る
+        const html = await (await this.request(`/live_chat?v=${this.videoId}`, { credentials: 'include' })).text();
+        if (this.stopped) return;
+
+        const data = readYouTubeInitialData(html);
+        if (!data) throw new Error('チャットのページを読み取れませんでした');
+        const chat = data.contents?.liveChatRenderer;
+        if (!chat) {
+          log(`YouTube: ${this.videoId} にはライブチャットがありません`);
+          return;
+        }
+
+        // チャット欄の表示の切り替え: [0] トップチャット / [1] チャット（すべてのメッセージ）
+        const views = chat.header?.liveChatHeaderRenderer?.viewSelector?.sortFilterSubMenuRenderer?.subMenuItems || [];
+        const view = views[this.options.CHAT_MODE === 'top' ? 0 : 1];
+        const token = view?.continuation?.reloadContinuationData?.continuation
+          || parseYouTubeContinuation(chat.continuations)?.token;
+        if (!token) throw new Error('チャットの取得位置が見つかりませんでした');
+
+        const config = readYouTubeConfig(html);
+        this.context = config.INNERTUBE_CONTEXT
+          || { client: { clientName: 'WEB', clientVersion: config.INNERTUBE_CLIENT_VERSION } };
+        this.continuation = token;
+        this.skipBacklog = true;
+        log(`YouTube: ${this.videoId} のチャットに接続しました`);
+        this.poll();
+      } catch (e) {
+        this.retryLater(e);
+      }
+    }
+
+    async poll() {
+      try {
+        const res = await this.request('/youtubei/v1/live_chat/get_live_chat?prettyPrint=false', {
+          method: 'POST',
+          credentials: 'omit', // 読み取り専用の匿名ユーザーとして取得する
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ context: this.context, continuation: this.continuation }),
+        });
+        const chat = (await res.json()).continuationContents?.liveChatContinuation;
+        if (this.stopped) return;
+
+        // 続きがないのは配信が終わったときなど。チャットのページを読み直して確かめる
+        const next = parseYouTubeContinuation(chat?.continuations);
+        if (!next) throw new Error('チャットの続きがありません');
+
+        if (!this.skipBacklog) this.handleActions(chat.actions || [], this.pollDelay + YOUTUBE_BATCH_SLACK_MS);
+        this.continuation = next.token;
+        this.skipBacklog = next.reload;
+        this.retryCount = 0;
+        // 静かなチャットでは間隔を指定されること（timedContinuationData）があるので、それより早く取りに行かない
+        this.pollDelay = Math.max(YOUTUBE_POLL_MS, next.minDelay);
+        this.timer = setTimeout(() => this.poll(), this.pollDelay);
+      } catch (e) {
+        this.retryLater(e);
+      }
+    }
+
+    retryLater(error) {
+      if (this.stopped) return; // stop() で中断した場合
+      const delay = Math.min(30000, 1000 * 2 ** this.retryCount++);
+      log(`YouTube: ${error.message}。${delay / 1000} 秒後に接続し直します`);
+      this.timer = setTimeout(() => this.connect(), delay);
+    }
+
+    /**
+     * 1回の取得で届いた操作（コメントの追加・削除など）を処理する
+     * @param {number} maxSpan  最新のコメントよりこれ以上前に投稿されたコメントは流さない（ミリ秒）
+     */
+    handleActions(actions, maxSpan) {
+      const batch = [];
+      const deletes = [];
+      for (const action of actions) {
+        const item = action.addChatItemAction?.item;
+        if (item) {
+          if (item.liveChatPlaceholderItemRenderer) {
+            this.placeholders.add(item.liveChatPlaceholderItemRenderer.id);
+            if (this.placeholders.size > 500) this.placeholders.delete(this.placeholders.values().next().value);
+          } else {
+            batch.push(parseYouTubeItem(item, this.options));
+          }
+        } else if (action.replaceChatItemAction) {
+          // 審査中だったメッセージの中身が届いた
+          const { targetItemId, replacementItem } = action.replaceChatItemAction;
+          if (this.placeholders.delete(targetItemId) && replacementItem) {
+            batch.push(parseYouTubeItem(replacementItem, this.options));
+          }
+        } else {
+          const target = parseYouTubeDeleteAction(action);
+          if (!target) continue;
+          if (target.id) this.placeholders.delete(target.id);
+          deletes.push(target);
+        }
+      }
+
+      // まだ流していないコメントが削除されたら、流すのをやめる
+      const isDeleted = c => deletes.some(t => (t.id ? c.id === t.id : c.author.id === t.authorId));
+      for (const entry of this.pending) {
+        if (!isDeleted(entry.comment)) continue;
+        clearTimeout(entry.timer);
+        this.pending.delete(entry);
+      }
+      this.schedule(batch.filter(b => b && !isDeleted(b.comment)), maxSpan);
+      for (const target of deletes) this.handlers.onDelete(target);
+    }
+
+    /**
+     * 1回の取得で届いたコメントを、投稿された間隔を保ったまま流す。
+     * まとめて流すと、一度に画面が埋まったあと次の取得まで何も流れなくなるため。
+     * @param {{comment: FlowComment, time: number}[]} batch
+     * @param {number} maxSpan
+     */
+    schedule(batch, maxSpan) {
+      const timesOf = items => items.map(b => b.time).filter(Number.isFinite);
+      // タブが裏にある間にたまった分など、古すぎるコメントは流さない（投稿時刻が不明なものは流す）
+      const cutoff = Math.max(...timesOf(batch)) - maxSpan;
+      const recent = batch.filter(b => !Number.isFinite(b.time) || b.time >= cutoff);
+      const oldest = Math.min(...timesOf(recent));
+      for (const { comment, time } of recent) {
+        const entry = { comment, timer: 0 };
+        entry.timer = setTimeout(() => {
+          this.pending.delete(entry);
+          this.handlers.onComment(comment);
+        }, Number.isFinite(time) ? time - oldest : 0);
+        this.pending.add(entry);
+      }
+    }
+  }
+
+  /** @type {PlatformAdapter} */
+  const YouTubeAdapter = {
+    name: 'YouTube',
+
+    matches: loc => loc.hostname === 'www.youtube.com',
+
+    // URL は /watch?v=… のほか /@channel/live のように動画 ID を含まない形もあるので、表示中の動画ページから読む。
+    // チャット欄のない通常の動画では null を返し、チャットのページを取得しに行かないようにする
+    // （チャットのリプレイがあるアーカイブは、取得したページにライブチャットがないことで判断する）
+    getStreamKey() {
+      const page = document.querySelector('ytd-watch-flexy:not([hidden])');
+      if (!page?.querySelector('ytd-live-chat-frame')) return null;
+      const videoId = page.getAttribute('video-id');
+      return /^[\w-]{11}$/.test(videoId) ? videoId : null;
+    },
+
+    findPlayer() {
+      const video = findLargestVideo(document.querySelectorAll('#movie_player video'));
+      const container = video?.closest('.html5-video-container');
+      if (!container) return null;
+      // 映像の入れ物（.html5-video-container）は大きさが 0 なので、その中ではなく直後に同じ z-index で重ねる。
+      // こうすると映像より上、字幕やプレイヤーの操作ボタンより下に表示される
+      return {
+        video,
+        parent: container.parentElement,
+        before: container.nextSibling,
+        zIndex: getComputedStyle(container).zIndex,
+      };
+    },
+
+    createSource: (videoId, handlers) => new YouTubeChatSource(videoId, handlers, CONFIG.YOUTUBE),
+  };
+
+  /* ===========================================================================
    * 新しいプラットフォームに対応するには:
    *   1. CommentSource（start / stop を持ち、handlers.onComment に FlowComment を渡す）を実装する
    *   2. PlatformAdapter（matches / getStreamKey / findPlayer / createSource）を実装する
@@ -924,11 +1288,11 @@
    * ======================================================================== */
 
   /* ===========================================================================
-   * 8. 起動
+   * 9. 起動
    * ======================================================================== */
 
   /** @type {PlatformAdapter[]} */
-  const ADAPTERS = [TwitchAdapter];
+  const ADAPTERS = [TwitchAdapter, YouTubeAdapter];
 
   const adapter = ADAPTERS.find(a => a.matches(location));
   if (!adapter) return;
