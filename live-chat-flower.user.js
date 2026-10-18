@@ -485,9 +485,9 @@
       const durationMs = this.config.DURATION_SEC * 1000;
       const distance = g.width + width;
       const speed = (this.config.SPEED_MODE === 'constant' ? g.width : distance) / durationMs; // px/ms
-      // 衝突判定とアニメーションで同じ時計を使う（performance.now() だと、描画が止まっている間に
-      // アニメーションの開始だけが遅れて位置がずれる）
-      const now = document.timeline.currentTime ?? performance.now();
+      // document.timeline.currentTime は描画が行われないと進まない（全画面で映像のほかに動くものがないときなど）ので、
+      // 開始時刻に使うとコメントが途中から現れたり、表示される前に流れ終わったりする。performance.now() を使う
+      const now = performance.now();
       const lane = this.pickLane(now, width, speed);
       if (lane < 0) {
         el.remove();
@@ -500,7 +500,9 @@
         [{ transform: `translateX(${g.width}px)` }, { transform: `translateX(${-width}px)` }],
         { duration: distance / speed, easing: 'linear' },
       );
-      item.anim.startTime = now; // 次の描画フレームを待たずに、判定に使った時刻を開始時刻にする
+      // アニメーションは次に描画されるときに始まり、それまでは上で指定した transform で画面の右外にいる。
+      // こうすると描画が遅れても必ず右端から流れる。衝突判定は実際に始まった時刻で計算し直す
+      item.anim.ready?.then(() => { item.start = performance.now(); }, () => {});
       item.anim.onfinish = () => this.removeItem(item);
       this.items.add(item);
       this.lanes[lane] = item;
